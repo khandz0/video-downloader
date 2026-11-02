@@ -63,6 +63,10 @@ def clip_filename(prefix, part_number, start, end):
     return f"{prefix} - part {part_number} [{start.strip()} - {end.strip()}].mp4"
 
 
+def full_filename(prefix):
+    return f"{prefix}.mp4"
+
+
 def validate_youtube_url(url):
     parsed = urlparse(url.strip())
     host = (parsed.hostname or "").lower()
@@ -82,7 +86,10 @@ def parse_request(data):
     if not isinstance(prefix, str):
         raise ValueError("Prefix must be text.")
     prefix = sanitize_prefix(prefix)
-    if not isinstance(parts, list) or len(parts) == 0:
+    whole = data.get("whole", False)
+    if not isinstance(whole, bool):
+        raise ValueError("Whole video must be yes or no.")
+    if not isinstance(parts, list):
         raise ValueError("Add at least one clip.")
     cleaned_parts = []
     for part in parts:
@@ -92,9 +99,15 @@ def parse_request(data):
         end = part.get("end", "")
         if not isinstance(start, str) or not isinstance(end, str):
             raise ValueError("Each clip needs a start and an end.")
+        start = start.strip()
+        end = end.strip()
+        if start == "" and end == "":
+            continue
         validate_part(start, end)
-        cleaned_parts.append({"start": start.strip(), "end": end.strip()})
-    return url.strip(), prefix, cleaned_parts
+        cleaned_parts.append({"start": start, "end": end})
+    if not whole and len(cleaned_parts) == 0:
+        raise ValueError("Add at least one clip.")
+    return url.strip(), prefix, cleaned_parts, whole
 
 
 def require_tools():
@@ -130,9 +143,7 @@ def _cleanup_failed_part(destination, before):
             path.unlink(missing_ok=True)
 
 
-def download_section(url, start, end, destination):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    before = set(destination.parent.iterdir())
+def download_command(url, destination, start=None, end=None):
     command = [
         "yt-dlp",
         "--no-update",
@@ -142,13 +153,23 @@ def download_section(url, start, end, destination):
         "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
         "--merge-output-format",
         "mp4",
-        "--download-sections",
-        f"*{start}-{end}",
-        "--force-keyframes-at-cuts",
-        "-o",
-        str(destination),
-        url,
     ]
+    if start is not None:
+        command.extend(
+            [
+                "--download-sections",
+                f"*{start}-{end}",
+                "--force-keyframes-at-cuts",
+            ]
+        )
+    command.extend(["-o", str(destination), url])
+    return command
+
+
+def download_section(url, start, end, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    before = set(destination.parent.iterdir())
+    command = download_command(url, destination, start=start, end=end)
     result = subprocess.run(command, check=False, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         _cleanup_failed_part(destination, before)
@@ -173,8 +194,9 @@ def public_status():
         }
 
 
-def _run_job(url, prefix, parts):
+def _run_job(url, prefix, parts, whole):
     files = []
+    steps = len(parts) + (1 if whole else 0)
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         chosen = prefix
@@ -182,16 +204,30 @@ def _run_job(url, prefix, parts):
             _set_status(
                 state="running",
                 current=0,
-                total=len(parts),
+                total=steps,
                 message="Reading video title",
                 files=[],
             )
             chosen = video_title(url)
-        for index, part in enumerate(parts, start=1):
+        step = 0
+        if whole:
+            step += 1
             _set_status(
                 state="running",
-                current=index,
-                total=len(parts),
+                current=step,
+                total=steps,
+                message="Downloading full video",
+                files=files,
+            )
+            destination = OUTPUT_DIR / full_filename(chosen)
+            download_section(url, None, None, destination)
+            files.append(str(destination))
+        for index, part in enumerate(parts, start=1):
+            step += 1
+            _set_status(
+                state="running",
+                current=step,
+                total=steps,
                 message=f"Part {index} of {len(parts)}",
                 files=files,
             )
@@ -202,8 +238,8 @@ def _run_job(url, prefix, parts):
             files.append(str(destination))
         _set_status(
             state="done",
-            current=len(parts),
-            total=len(parts),
+            current=steps,
+            total=steps,
             message="Saved.",
             files=files,
         )
@@ -211,19 +247,20 @@ def _run_job(url, prefix, parts):
         _set_status(state="error", message=str(exc), files=files)
 
 
-def start_job(url, prefix, parts):
+def start_job(url, prefix, parts, whole):
+    steps = len(parts) + (1 if whole else 0)
     with _lock:
         if _status["state"] == "running":
             raise RuntimeError("A download is already running.")
         _status.update(
             state="running",
             current=0,
-            total=len(parts),
+            total=steps,
             message="Starting",
             files=[],
         )
     threading.Thread(
-        target=_run_job, args=(url, prefix, parts), daemon=True
+        target=_run_job, args=(url, prefix, parts, whole), daemon=True
     ).start()
 
 
@@ -247,6 +284,8 @@ PAGE = """<!DOCTYPE html>
     button.secondary, button.remove { background: transparent; color: #1c1915; border: 1px solid #c9c1b4; }
     button.remove { padding: 0.55rem 0.7rem; }
     button:disabled { opacity: 0.45; cursor: default; }
+    label.check { display: flex; align-items: center; gap: 0.55rem; margin: 0.2rem 0 1rem; font: 1rem/1.3 ui-sans-serif, system-ui, sans-serif; }
+    label.check input { width: 1rem; height: 1rem; margin: 0; }
     .actions { display: flex; gap: 0.6rem; margin-top: 0.4rem; }
     #status { margin-top: 1.4rem; white-space: pre-wrap; }
     #files { padding-left: 1.1rem; }
@@ -256,7 +295,7 @@ PAGE = """<!DOCTYPE html>
 <body>
   <main>
     <h1>Video clips</h1>
-    <p class="note">Each row downloads only that time range into <code>output/</code> next to this tool.</p>
+    <p class="note">Each row downloads only that time range into <code>output/</code>. Check the box to also save the full video as <code>prefix.mp4</code>.</p>
     <form id="form">
       <div class="field">
         <label for="url">YouTube URL</label>
@@ -266,6 +305,7 @@ PAGE = """<!DOCTYPE html>
         <label for="prefix">Filename prefix</label>
         <input id="prefix" name="prefix" type="text" placeholder="Leave blank to use the video title">
       </div>
+      <label class="check" for="whole"><input id="whole" name="whole" type="checkbox">Download the whole video</label>
       <div id="rows"></div>
       <div class="actions">
         <button type="button" class="secondary" id="add">Add part</button>
@@ -280,6 +320,12 @@ PAGE = """<!DOCTYPE html>
     const status = document.querySelector("#status");
     const files = document.querySelector("#files");
     const save = document.querySelector("#save");
+    const whole = document.querySelector("#whole");
+
+    function syncRequired() {
+      const needed = !whole.checked;
+      for (const input of rows.querySelectorAll("input")) input.required = needed;
+    }
 
     function addRow(start, end) {
       const row = document.createElement("div");
@@ -293,9 +339,11 @@ PAGE = """<!DOCTYPE html>
         row.remove();
       });
       rows.appendChild(row);
+      syncRequired();
     }
 
     addRow();
+    whole.addEventListener("change", syncRequired);
     document.querySelector("#add").addEventListener("click", () => addRow());
 
     function show(data) {
@@ -334,6 +382,7 @@ PAGE = """<!DOCTYPE html>
         body: JSON.stringify({
           url: document.querySelector("#url").value.trim(),
           prefix: document.querySelector("#prefix").value,
+          whole: whole.checked,
           parts,
         }),
       });
@@ -379,9 +428,9 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(raw.decode("utf-8"))
             except json.JSONDecodeError as exc:
                 raise ValueError("Request must be JSON.") from exc
-            url, prefix, parts = parse_request(data)
+            url, prefix, parts, whole = parse_request(data)
             require_tools()
-            start_job(url, prefix, parts)
+            start_job(url, prefix, parts, whole)
         except ValueError as exc:
             self._json(400, {"error": str(exc)})
         except RuntimeError as exc:

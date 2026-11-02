@@ -54,6 +54,51 @@ class FilenameTests(unittest.TestCase):
         )
 
 
+class WholeVideoTests(unittest.TestCase):
+    def test_full_filename(self):
+        self.assertEqual(clip.full_filename("Nghia Si"), "Nghia Si.mp4")
+
+    def test_whole_video_without_parts(self):
+        url, prefix, parts, whole = clip.parse_request(
+            {
+                "url": "https://youtu.be/-BNGtv0R7ho",
+                "prefix": "Nghia Si",
+                "parts": [{"start": "", "end": ""}],
+                "whole": True,
+            }
+        )
+        self.assertEqual(url, "https://youtu.be/-BNGtv0R7ho")
+        self.assertEqual(prefix, "Nghia Si")
+        self.assertEqual(parts, [])
+        self.assertTrue(whole)
+
+    def test_parts_still_required_without_whole_video(self):
+        with self.assertRaises(ValueError):
+            clip.parse_request(
+                {
+                    "url": "https://youtu.be/-BNGtv0R7ho",
+                    "prefix": "Nghia Si",
+                    "parts": [{"start": "", "end": ""}],
+                    "whole": False,
+                }
+            )
+
+    def test_full_download_command_has_no_time_range(self):
+        command = clip.download_command("https://youtu.be/-BNGtv0R7ho", "video.mp4")
+        self.assertNotIn("--download-sections", command)
+        self.assertIn("video.mp4", command)
+
+    def test_section_download_command_keeps_time_range(self):
+        command = clip.download_command(
+            "https://youtu.be/-BNGtv0R7ho",
+            "part.mp4",
+            start="2:02",
+            end="2:15",
+        )
+        self.assertIn("--download-sections", command)
+        self.assertIn("*2:02-2:15", command)
+
+
 class UrlTests(unittest.TestCase):
     def test_accepts_youtube_hosts(self):
         clip.validate_youtube_url("https://youtu.be/-BNGtv0R7ho")
