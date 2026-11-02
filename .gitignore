@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+output/
+*.mp4
+*.part
+source.mp4
